@@ -1,0 +1,630 @@
+openapi: 3.0.3
+
+info:
+  title: LAPS Loan Application API
+  version: 1.0.0
+  description: |
+    Учебный API для обработки кредитных заявок.
+
+    API моделирует сценарий, при котором LAPS выполняет до трёх попыток
+    обращения в Кредитное бюро, включая первоначальный запрос. Если после
+    трёх попыток успешный ответ не получен, заявка переводится в статус
+    MANUAL_REVIEW.
+
+    Все данные, идентификаторы и endpoint'ы в спецификации учебные.
+
+servers:
+  - url: https://api.example-bank.kz
+    description: Учебный сервер
+
+tags:
+  - name: Loan Applications
+    description: Операции с кредитными заявками
+
+paths:
+  /api/v1/loan-applications:
+    post:
+      tags:
+        - Loan Applications
+      summary: Создать и отправить кредитную заявку
+      description: |
+        Создаёт новую кредитную заявку и запускает её асинхронную обработку.
+
+        Для предотвращения дублей клиент должен передавать уникальный
+        Idempotency-Key. Повторный запрос с тем же ключом и идентичным body
+        не создаёт новую заявку и возвращает результат первоначальной операции.
+      operationId: createLoanApplication
+
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoanApplicationRequest'
+            examples:
+              validRequest:
+                summary: Валидная заявка
+                value:
+                  productCode: CONSUMER_LOAN
+                  requestedAmount: 2500000
+                  termMonths: 24
+                  monthlyIncome: 450000
+                  consents:
+                    personalDataProcessing: true
+                    creditHistoryCheck: true
+
+      responses:
+        '202':
+          description: |
+            Заявка успешно создана и принята в асинхронную обработку.
+            Итоговый статус будет доступен через GET-запрос.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoanApplicationCreatedResponse'
+              examples:
+                applicationAccepted:
+                  summary: Заявка принята
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: SUBMITTED
+                    createdAt: '2026-09-13T12:00:00+05:00'
+
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+        '409':
+          $ref: '#/components/responses/IdempotencyConflictError'
+
+        '422':
+          $ref: '#/components/responses/BusinessRuleViolationError'
+
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/loan-applications/{applicationId}:
+    get:
+      tags:
+        - Loan Applications
+      summary: Получить полную информацию по кредитной заявке
+      description: |
+        Возвращает актуальную информацию по кредитной заявке.
+
+        Набор дополнительных полей зависит от статуса заявки.
+        Технические причины ручного рассмотрения, correlationId,
+        attemptCount и внутренние коды ошибок не возвращаются в MB.
+      operationId: getLoanApplication
+
+      parameters:
+        - $ref: '#/components/parameters/ApplicationId'
+        - $ref: '#/components/parameters/CorrelationId'
+
+      responses:
+        '200':
+          description: Информация по заявке успешно получена
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/LoanApplicationManualReviewResponse'
+                  - $ref: '#/components/schemas/LoanApplicationApprovedResponse'
+                  - $ref: '#/components/schemas/LoanApplicationRejectedResponse'
+                discriminator:
+                  propertyName: status
+                  mapping:
+                    MANUAL_REVIEW: '#/components/schemas/LoanApplicationManualReviewResponse'
+                    APPROVED: '#/components/schemas/LoanApplicationApprovedResponse'
+                    REJECTED: '#/components/schemas/LoanApplicationRejectedResponse'
+
+              examples:
+                manualReview:
+                  summary: Заявка на ручном рассмотрении
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: MANUAL_REVIEW
+                    requestedAmount: 2500000
+                    termMonths: 24
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+                approved:
+                  summary: Одобренная заявка
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: APPROVED
+                    requestedAmount: 2500000
+                    approvedAmount: 2500000
+                    currency: KZT
+                    termMonths: 24
+                    interestRate: 19.9
+                    monthlyPayment: 127500
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+                rejected:
+                  summary: Отклонённая заявка
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: REJECTED
+                    requestedAmount: 2500000
+                    termMonths: 24
+                    customerMessage: К сожалению, сейчас мы не можем одобрить заявку на кредит.
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+        '404':
+          $ref: '#/components/responses/ApplicationNotFoundError'
+
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/loan-applications/{applicationId}/status:
+    get:
+      tags:
+        - Loan Applications
+      summary: Получить текущий статус кредитной заявки
+      description: |
+        Возвращает краткую актуальную информацию о статусе заявки.
+
+        Endpoint может использоваться MB для обновления статуса после
+        получения push-уведомления или при открытии списка заявок.
+      operationId: getLoanApplicationStatus
+
+      parameters:
+        - $ref: '#/components/parameters/ApplicationId'
+        - $ref: '#/components/parameters/CorrelationId'
+
+      responses:
+        '200':
+          description: Статус заявки успешно получен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoanApplicationStatusResponse'
+              examples:
+                manualReview:
+                  summary: Ручное рассмотрение
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: MANUAL_REVIEW
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+                approved:
+                  summary: Кредит одобрен
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: APPROVED
+                    approvedAmount: 2500000
+                    currency: KZT
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+                rejected:
+                  summary: Кредитная заявка отклонена
+                  value:
+                    applicationId: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+                    status: REJECTED
+                    updatedAt: '2026-09-13T12:15:00+05:00'
+
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+        '404':
+          $ref: '#/components/responses/ApplicationNotFoundError'
+
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ApplicationId:
+      name: applicationId
+      in: path
+      required: true
+      description: Уникальный идентификатор кредитной заявки
+      schema:
+        type: string
+        format: uuid
+      example: f7c3b6c5-257a-4511-97f3-e9e6a83dd60c
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Уникальный UUID одной логической операции создания заявки.
+
+        При техническом повторе запроса, двойном нажатии или timeout
+        клиент должен передавать тот же ключ.
+
+        При создании новой заявки пользователь должен передать новый ключ.
+      schema:
+        type: string
+        format: uuid
+      example: 9b65a34a-bdac-448c-a2ae-4bbf1934fb34
+
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Идентификатор сквозной трассировки запроса между системами
+      schema:
+        type: string
+        format: uuid
+      example: b5fb1e80-26d5-47f8-bae6-4424d46d421b
+
+  schemas:
+    LoanApplicationRequest:
+      type: object
+      required:
+        - productCode
+        - requestedAmount
+        - termMonths
+        - monthlyIncome
+        - consents
+      properties:
+        productCode:
+          type: string
+          description: Код кредитного продукта
+          example: CONSUMER_LOAN
+
+        requestedAmount:
+          type: number
+          format: decimal
+          minimum: 100000
+          maximum: 5000000
+          description: Запрашиваемая сумма кредита в тенге
+          example: 2500000
+
+        termMonths:
+          type: integer
+          minimum: 6
+          maximum: 60
+          description: Срок кредита в месяцах
+          example: 24
+
+        monthlyIncome:
+          type: number
+          format: decimal
+          minimum: 0
+          description: Ежемесячный доход клиента в тенге
+          example: 450000
+
+        consents:
+          $ref: '#/components/schemas/Consents'
+
+    Consents:
+      type: object
+      required:
+        - personalDataProcessing
+        - creditHistoryCheck
+      properties:
+        personalDataProcessing:
+          type: boolean
+          description: Согласие на обработку персональных данных
+          example: true
+
+        creditHistoryCheck:
+          type: boolean
+          description: Согласие на получение кредитной истории
+          example: true
+
+    LoanApplicationCreatedResponse:
+      type: object
+      required:
+        - applicationId
+        - status
+        - createdAt
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор созданной заявки
+
+        status:
+          type: string
+          enum:
+            - SUBMITTED
+          description: Начальный статус созданной заявки
+
+        createdAt:
+          type: string
+          format: date-time
+          description: Дата и время создания заявки
+
+    LoanApplicationManualReviewResponse:
+      type: object
+      required:
+        - applicationId
+        - status
+        - requestedAmount
+        - termMonths
+        - updatedAt
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+
+        status:
+          type: string
+          enum:
+            - MANUAL_REVIEW
+
+        requestedAmount:
+          type: number
+          format: decimal
+
+        termMonths:
+          type: integer
+
+        updatedAt:
+          type: string
+          format: date-time
+
+    LoanApplicationApprovedResponse:
+      type: object
+      required:
+        - applicationId
+        - status
+        - requestedAmount
+        - approvedAmount
+        - currency
+        - termMonths
+        - interestRate
+        - monthlyPayment
+        - updatedAt
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+
+        status:
+          type: string
+          enum:
+            - APPROVED
+
+        requestedAmount:
+          type: number
+          format: decimal
+
+        approvedAmount:
+          type: number
+          format: decimal
+          description: Одобренная сумма кредита
+
+        currency:
+          type: string
+          enum:
+            - KZT
+          description: Валюта одобренного кредита
+
+        termMonths:
+          type: integer
+
+        interestRate:
+          type: number
+          format: float
+          description: Процентная ставка в процентах годовых
+          example: 19.9
+
+        monthlyPayment:
+          type: number
+          format: decimal
+          description: Ежемесячный платёж
+
+        updatedAt:
+          type: string
+          format: date-time
+
+    LoanApplicationRejectedResponse:
+      type: object
+      required:
+        - applicationId
+        - status
+        - requestedAmount
+        - termMonths
+        - customerMessage
+        - updatedAt
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+
+        status:
+          type: string
+          enum:
+            - REJECTED
+
+        requestedAmount:
+          type: number
+          format: decimal
+
+        termMonths:
+          type: integer
+
+        customerMessage:
+          type: string
+          description: Нейтральное сообщение для клиента без внутренних причин отказа
+          example: К сожалению, сейчас мы не можем одобрить заявку на кредит.
+
+        updatedAt:
+          type: string
+          format: date-time
+
+    LoanApplicationStatusResponse:
+      type: object
+      required:
+        - applicationId
+        - status
+        - updatedAt
+      properties:
+        applicationId:
+          type: string
+          format: uuid
+
+        status:
+          type: string
+          enum:
+            - DRAFT
+            - SUBMITTED
+            - SCORING_IN_PROGRESS
+            - APPROVED
+            - REJECTED
+            - MANUAL_REVIEW
+
+        approvedAmount:
+          type: number
+          format: decimal
+          nullable: true
+          description: Возвращается только при статусе APPROVED
+
+        currency:
+          type: string
+          nullable: true
+          enum:
+            - KZT
+          description: Возвращается только при статусе APPROVED
+
+        updatedAt:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      required:
+        - errorCode
+        - message
+      properties:
+        errorCode:
+          type: string
+          description: Внутренний код ошибки, предназначенный для обработки на frontend
+          example: VALIDATION_ERROR
+
+        message:
+          type: string
+          description: Текст ошибки, допустимый для отображения пользователю
+          example: Не заполнено обязательное поле requestedAmount.
+
+        correlationId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Идентификатор трассировки; не должен отображаться клиенту
+          example: b5fb1e80-26d5-47f8-bae6-4424d46d421b
+
+        fieldErrors:
+          type: array
+          nullable: true
+          description: Ошибки отдельных полей, возвращаются при ошибке валидации
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    FieldError:
+      type: object
+      required:
+        - field
+        - message
+      properties:
+        field:
+          type: string
+          example: requestedAmount
+
+        message:
+          type: string
+          example: Значение должно быть больше или равно 100000.
+
+  responses:
+    ValidationError:
+      description: Ошибка валидации входящих данных
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errorCode: VALIDATION_ERROR
+            message: В запросе содержатся ошибки валидации.
+            correlationId: b5fb1e80-26d5-47f8-bae6-4424d46d421b
+            fieldErrors:
+              - field: requestedAmount
+                message: Значение должно быть больше или равно 100000.
+
+    UnauthorizedError:
+      description: Пользователь не авторизован или access token истёк
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errorCode: UNAUTHORIZED
+            message: Требуется повторная авторизация.
+
+    ApplicationNotFoundError:
+      description: Кредитная заявка не найдена
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errorCode: APPLICATION_NOT_FOUND
+            message: Кредитная заявка не найдена.
+
+    IdempotencyConflictError:
+      description: Idempotency-Key ранее был использован с другим набором параметров
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errorCode: IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD
+            message: Idempotency-Key уже был использован для другой заявки.
+
+    BusinessRuleViolationError:
+      description: Заявка не соответствует правилам кредитного продукта
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            amountOutOfRange:
+              summary: Сумма вне доступного диапазона
+              value:
+                errorCode: REQUESTED_AMOUNT_OUT_OF_RANGE
+                message: Запрашиваемая сумма превышает лимит выбранного продукта.
+
+            termNotAvailable:
+              summary: Недоступный срок кредита
+              value:
+                errorCode: TERM_NOT_AVAILABLE
+                message: Выбранный срок кредита недоступен для данного продукта.
+
+            activeApplicationExists:
+              summary: Уже существует активная заявка
+              value:
+                errorCode: ACTIVE_APPLICATION_ALREADY_EXISTS
+                message: У вас уже есть кредитная заявка в процессе рассмотрения.
+
+    InternalError:
+      description: Непредвиденная внутренняя ошибка LAPS
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            errorCode: INTERNAL_ERROR
+            message: Не удалось обработать заявку. Попробуйте позже.
+            correlationId: b5fb1e80-26d5-47f8-bae6-4424d46d421b
+
+security:
+  - bearerAuth: []
